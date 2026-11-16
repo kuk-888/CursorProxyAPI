@@ -1,0 +1,36 @@
+[Unit]
+Description=CursorProxyAPI - Cursor SDK to OpenAI & Claude API proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cursorgw
+Group=cursorgw
+WorkingDirectory=/opt/cursor-proxy-api
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/cursor-proxy-api
+Environment=CURSOR_DATA_DIR=/var/lib/cursor-proxy-api/.cursor
+Environment=DATA_DIR=/opt/cursor-proxy-api
+EnvironmentFile=/opt/cursor-proxy-api/.env
+ExecStart=/usr/bin/env node /opt/cursor-proxy-api/dist/src/server.js
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+# Hardening: the process only needs to read its own dir, write state files there, and talk to the network.
+NoNewPrivileges=true
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cursor-proxy-api /var/lib/cursor-proxy-api /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

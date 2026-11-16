@@ -1,0 +1,32 @@
+{
+  "name": "cursor-proxy-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unofficial multi-account OpenAI & Anthropic compatible API proxy for @cursor/sdk with sticky session affinity, quota-aware load balancing, and an optional Web Console.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "README_EN.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "dev": "node --experimental-strip-types src/server.ts",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.31"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,788 @@
+import crypto from "node:crypto";
+import {
+  GatewayError,
+  type NormalizedImage,
+  type NormalizedTool,
+  type NormalizedToolCall,
+  type NormalizedToolResult,
+  type ParsedProtocolTurn,
+  type ToolChoiceMode,
+  type TurnTokenMetrics
+} from "../core/types.js";
+import { computeDialogPrefixHashes, type HashableDialogItem } from "../utils/hash.js";
+import { deriveConversationAffinityKey } from "../core/session-affinity.js";
+import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
+
+function extractContentParts(content: unknown): { text: string; images: NormalizedImage[] } {
+  if (typeof content === "string") return { text: content, images: [] };
+  if (!Array.isArray(content)) return { text: "", images: [] };
+
+  const texts: string[] = [];
+  const images: NormalizedImage[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      texts.push(part);
+      continue;
+    }
+    if (!isRecord(part)) continue;
+    const pType = typeof part.type === "string" ? part.type : "";
+    if ((pType === "text" || pType === "input_text" || pType === "output_text") && typeof part.text === "string") {
+      texts.push(part.text);
+    } else if (pType === "image_url") {
+      const urlVal = typeof part.image_url === "string"
+        ? part.image_url
+        : isRecord(part.image_url) && typeof part.image_url.url === "string"
+          ? part.image_url.url
+          : "";
+      const parsed = parseDataUrlOrRemoteImage(urlVal);
+      if (parsed) images.push(parsed);
+    } else if (pType === "input_image") {
+      const urlVal = typeof part.image_url === "string"
+        ? part.image_url
+        : typeof part.url === "string"
+          ? part.url
+          : "";
+      const parsed = parseDataUrlOrRemoteImage(urlVal);
+      if (parsed) images.push(parsed);
+    }
+  }
+  return { text: texts.join("\n"), images };
+}
+
+export function parseOpenAiTools(rawTools: unknown): {
+  customTools: NormalizedTool[];
+  nativeSdkTools: Array<"webSearch" | "webFetch">;
+} {
+  if (!Array.isArray(rawTools)) return { customTools: [], nativeSdkTools: [] };
+  const customTools: NormalizedTool[] = [];
+  const nativeSet = new Set<"webSearch" | "webFetch">();
+
+  for (const item of rawTools) {
+    if (!isRecord(item)) continue;
+    const rawType = typeof item.type === "string" ? item.type.trim().toLowerCase() : "";
+
+    // Native built-in search tools (OpenAI `web_search_preview` / `web_search`, xAI `x_search`)
+    if (
+      rawType === "web_search" ||
+      rawType === "web_search_preview" ||
+      rawType.startsWith("web_search_") ||
+      rawType === "x_search"
+    ) {
+      nativeSet.add("webSearch");
+      nativeSet.add("webFetch");
+      continue;
+    }
+    if (rawType === "web_fetch") {
+      nativeSet.add("webFetch");
+      continue;
+    }
+
+    if (item.type === "function" && isRecord(item.function)) {
+      const fn = item.function;
+      const name = typeof fn.name === "string" ? fn.name.trim() : "";
+      if (!name) continue;
+      customTools.push({
+        name,
+        ...(typeof fn.description === "string" && fn.description ? { description: fn.description } : {}),
+        inputSchema: isRecord(fn.parameters) ? fn.parameters : { type: "object", properties: {} }
+      });
+    } else if (item.type === "function" && typeof item.name === "string" && item.name.trim()) {
+      customTools.push({
+        name: item.name.trim(),
+        ...(typeof item.description === "string" && item.description ? { description: item.description } : {}),
+        inputSchema: isRecord(item.parameters) ? item.parameters : { type: "object", properties: {} }
+      });
+    }
+  }
+  return { customTools, nativeSdkTools: [...nativeSet] };
+}
+
+export function parseOpenAiToolChoice(raw: unknown): ToolChoiceMode {
+  if (raw === "none") return "none";
+  if (raw === "required") return "required";
+  if (raw === "auto" || raw === undefined || raw === null) return "auto";
+  if (isRecord(raw)) {
+    if (raw.type === "function" && isRecord(raw.function) && typeof raw.function.name === "string") {
+      return { type: "tool", name: raw.function.name.trim() };
+    }
+    if (raw.type === "function" && typeof raw.name === "string") {
+      return { type: "tool", name: raw.name.trim() };
+    }
+  }
+  return "auto";
+}
+
+interface ChatTurnLine extends HashableDialogItem {
+  formattedLine: string;
+}
+
+/**
+ * Reject parameters whose absence would silently break the caller's own parsing logic.
+ * (Pure sampling hints such as temperature / max_tokens / stop are accepted and ignored; see README.)
+ */
+function assertNoUnsupportedStructuredOptions(body: Record<string, unknown>): void {
+  const viaText = !isRecord(body.response_format) && isRecord(body.text) && isRecord(body.text.format);
+  const fmt = isRecord(body.response_format) ? body.response_format : viaText ? (body.text as Record<string, unknown>).format as Record<string, unknown> : undefined;
+  const param = viaText ? "text.format" : "response_format";
+  if (fmt && fmt.type !== undefined && fmt.type !== "text") {
+    const kind = typeof fmt.type === "string" ? fmt.type : typeof fmt.type;
+    const hint =
+      kind === "json_schema"
+        ? "JSON Schema structured outputs cannot be enforced by the Cursor SDK; describe the schema in the prompt (or use a tool whose parameters are the schema) and validate client-side."
+        : kind === "json_object"
+          ? "JSON mode cannot be enforced by the Cursor SDK; ask for JSON in the prompt and parse it client-side."
+          : "Only the default text format is supported.";
+    throw new GatewayError(`\`${param}\` of type '${kind}' is not supported. ${hint}`, 400, "unsupported_parameter", param);
+  }
+  if (body.n !== undefined && body.n !== null && body.n !== 1) {
+    throw new GatewayError(
+      "`n` must be 1: this gateway returns exactly one completion per request.",
+      400,
+      "unsupported_parameter",
+      "n"
+    );
+  }
+  // Length caps cannot be honoured, but malformed values still deserve the same 400 the official API gives.
+  for (const key of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
+    const v = body[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
+      throw new GatewayError(`\`${key}\` must be a positive integer.`, 400, "invalid_request_error", key);
+    }
+  }
+}
+
+export function parseChatCompletionsRequest(
+  body: unknown,
+  headers: Record<string, string | string[] | undefined> = {},
+  signal?: AbortSignal
+): ParsedProtocolTurn {
+  if (!isRecord(body)) {
+    throw new GatewayError("Request body must be a JSON object.", 400, "invalid_request_error");
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    throw new GatewayError("`messages` must be a non-empty array.", 400, "invalid_request_error", "messages");
+  }
+  assertNoUnsupportedStructuredOptions(body);
+
+  const requestedModel = requireModelField(body);
+  const { customTools: tools, nativeSdkTools } = parseOpenAiTools(body.tools);
+  if (body.web_search_options && typeof body.web_search_options === "object") {
+    if (!nativeSdkTools.includes("webSearch")) nativeSdkTools.push("webSearch");
+    if (!nativeSdkTools.includes("webFetch")) nativeSdkTools.push("webFetch");
+  }
+  const toolChoice = parseOpenAiToolChoice(body.tool_choice);
+
+  const systemParts: string[] = [];
+  const items: ChatTurnLine[] = [];
+  const allImages: NormalizedImage[] = [];
+
+  for (const rawMsg of body.messages) {
+    if (!isRecord(rawMsg)) continue;
+    const role = typeof rawMsg.role === "string" ? rawMsg.role.toLowerCase() : "user";
+    const { text, images } = extractContentParts(rawMsg.content);
+    allImages.push(...images);
+
+    if (role === "system" || role === "developer") {
+      if (text.trim()) systemParts.push(text.trim());
+      continue;
+    }
+
+    if (role === "tool") {
+      const callId = typeof rawMsg.tool_call_id === "string" ? rawMsg.tool_call_id : "";
+      const name = typeof rawMsg.name === "string" ? rawMsg.name : "";
+      const meta = [name ? `name=${name}` : "", callId ? `id=${callId}` : ""].filter(Boolean).join(" ");
+      items.push({
+        role: "tool",
+        text,
+        images,
+        hasTools: true,
+        formattedLine: `[TOOL_RESULT${meta ? ` ${meta}` : ""}]:\n${text || "[empty]"}`
+      });
+      continue;
+    }
+
+    if (role === "assistant") {
+      const hasTools = Array.isArray(rawMsg.tool_calls) && rawMsg.tool_calls.length > 0;
+      const parts: string[] = [];
+      if (text.trim()) parts.push(`[ASSISTANT]:\n${text}`);
+      if (hasTools) {
+        const callsDesc = (rawMsg.tool_calls as unknown[])
+          .map((tc) => {
+            if (!isRecord(tc)) return "";
+            const id = typeof tc.id === "string" ? tc.id : "";
+            const fn = isRecord(tc.function) ? tc.function : {};
+            const name = typeof fn.name === "string" ? fn.name : "";
+            const args = typeof fn.arguments === "string" ? fn.arguments : "{}";
+            return `${name}(${args}) [id=${id}]`;
+          })
+          .filter(Boolean);
+        if (callsDesc.length) parts.push(`[ASSISTANT_TOOL_CALLS]:\n${callsDesc.join("\n")}`);
+      }
+      if (parts.length > 0) {
+        items.push({
+          role: "assistant",
+          text: text.trim(),
+          images: [],
+          hasTools,
+          formattedLine: parts.join("\n\n")
+        });
+      }
+      continue;
+    }
+
+    items.push({
+      role: "user",
+      text,
+      images,
+      hasTools: false,
+      formattedLine: `[USER]:\n${text || (images.length ? "[Image]" : "[empty]")}`
+    });
+  }
+
+  if (items.length === 0 && systemParts.length > 0) {
+    const lastSys = systemParts.pop()!;
+    items.push({ role: "user", text: lastSys, images: [], hasTools: false, formattedLine: lastSys });
+  }
+
+  const fullTranscriptText = items.length === 1 && items[0].role === "user"
+    ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
+    : items.map((it) => it.formattedLine).join("\n\n");
+
+  const systemJoined = systemParts.join("\n\n");
+  const toolSig = (toolChoice === "none" ? [] : tools).map((t) => t.name).join(",");
+  const prefixHashes = computeDialogPrefixHashes({
+    systemPrompt: systemJoined,
+    toolNamesSignature: toolSig,
+    items
+  });
+
+  const trailingToolResults: NormalizedToolResult[] = [];
+  let trailingUserText: string | undefined;
+  const trailingImages: NormalizedImage[] = [];
+  let idx = body.messages.length - 1;
+
+  if (idx >= 1 && isRecord(body.messages[idx]) && body.messages[idx].role === "user") {
+    const prev = body.messages[idx - 1];
+    if (isRecord(prev) && prev.role === "tool") {
+      const trailing = extractContentParts(body.messages[idx].content);
+      trailingUserText = trailing.text;
+      if (trailing.images.length) trailingImages.push(...trailing.images);
+      idx -= 1;
+    }
+  }
+
+  while (idx >= 0) {
+    const m = body.messages[idx];
+    if (!isRecord(m) || m.role !== "tool") break;
+    const callId = typeof m.tool_call_id === "string" ? m.tool_call_id.trim() : "";
+    if (callId) {
+      const parts = extractContentParts(m.content);
+      trailingToolResults.unshift({
+        toolCallId: callId,
+        ...(typeof m.name === "string" ? { name: m.name } : {}),
+        content: parts.text,
+        ...(parts.images.length ? { images: parts.images } : {})
+      });
+    }
+    idx -= 1;
+  }
+
+  const firstUserItem = items.find((it) => it.role === "user");
+  const conversationKey = deriveConversationAffinityKey({
+    headers,
+    rawBody: body,
+    systemPrompt: systemJoined,
+    firstUserText: firstUserItem?.text
+  });
+
+  return {
+    requestedModel,
+    rawBody: body,
+    ...(conversationKey ? { conversationKey } : {}),
+    ...(systemJoined ? { systemPrompt: systemJoined } : {}),
+    fullTranscriptText,
+    ...prefixHashes,
+    images: allImages,
+    tools,
+    ...(nativeSdkTools.length > 0 ? { nativeSdkTools } : {}),
+    toolChoice,
+    trailingToolResults,
+    ...(trailingUserText ? { trailingUserText } : {}),
+    ...(trailingImages.length ? { trailingImages } : {}),
+    hasToolResults: items.some((it) => it.role === "tool") || trailingToolResults.length > 0,
+    stream: body.stream === true,
+    includeStreamUsage: isRecord(body.stream_options) && body.stream_options.include_usage === true,
+    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length),
+    signal
+  };
+}
+
+export function parseResponsesRequest(
+  body: unknown,
+  headers: Record<string, string | string[] | undefined> = {},
+  signal?: AbortSignal
+): ParsedProtocolTurn {
+  if (!isRecord(body)) {
+    throw new GatewayError("Request body must be a JSON object.", 400, "invalid_request_error");
+  }
+
+  assertNoUnsupportedStructuredOptions(body);
+  if (typeof body.previous_response_id === "string" && body.previous_response_id.trim()) {
+    throw new GatewayError(
+      "`previous_response_id` is not supported: this gateway does not store responses. Resend the full conversation in `input`.",
+      400,
+      "unsupported_parameter",
+      "previous_response_id"
+    );
+  }
+
+  const requestedModel = requireModelField(body);
+  const { customTools: tools, nativeSdkTools } = parseOpenAiTools(body.tools);
+  const toolChoice = parseOpenAiToolChoice(body.tool_choice);
+  const systemParts: string[] = [];
+  if (typeof body.instructions === "string" && body.instructions.trim()) {
+    systemParts.push(body.instructions.trim());
+  }
+
+  const transcriptLines: string[] = [];
+  const items: HashableDialogItem[] = [];
+  const allImages: NormalizedImage[] = [];
+  const trailingToolResults: NormalizedToolResult[] = [];
+  let trailingUserText: string | undefined;
+  const trailingImages: NormalizedImage[] = [];
+  let hasToolResults = false;
+
+  if (typeof body.input === "string") {
+    transcriptLines.push(body.input);
+    items.push({ role: "user", text: body.input, images: [], hasTools: false });
+  } else if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (!isRecord(item)) continue;
+      const itemType = typeof item.type === "string" ? item.type : "message";
+      if (itemType === "function_call_output") {
+        hasToolResults = true;
+        const callId = typeof item.call_id === "string" ? item.call_id.trim() : "";
+        let outStr = "";
+        let outImages: NormalizedImage[] = [];
+        if (typeof item.output === "string") {
+          outStr = item.output;
+        } else if (Array.isArray(item.output)) {
+          const parts = extractContentParts(item.output);
+          outStr = parts.text;
+          outImages = parts.images;
+          allImages.push(...outImages);
+        } else {
+          outStr = JSON.stringify(item.output ?? "");
+        }
+        transcriptLines.push(`[TOOL_RESULT id=${callId}]:\n${outStr}`);
+        if (callId) {
+          trailingToolResults.push({
+            toolCallId: callId,
+            content: outStr,
+            ...(outImages.length ? { images: outImages } : {})
+          });
+        }
+        items.push({ role: "tool", text: outStr, images: outImages, hasTools: true });
+        continue;
+      }
+      if (itemType === "function_call") {
+        trailingToolResults.length = 0;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "{}";
+        const callId = typeof item.call_id === "string" ? item.call_id : "";
+        transcriptLines.push(`[ASSISTANT_TOOL_CALLS]:\n${name}(${args}) [id=${callId}]`);
+        items.push({ role: "assistant", text: "", images: [], hasTools: true });
+        continue;
+      }
+      if (itemType !== "message" && !("role" in item)) {
+        // reasoning / item_reference / web_search_call: carry no new input for the model.
+        if (itemType === "reasoning" || itemType === "item_reference" || itemType === "web_search_call") continue;
+        throw new GatewayError(
+          `Unsupported input item type '${itemType}'. This gateway refuses to silently ignore it.`,
+          400,
+          "invalid_request_error",
+          "input"
+        );
+      }
+      const role = typeof item.role === "string" ? item.role.toLowerCase() : "user";
+      const { text, images } = extractContentParts(item.content);
+      allImages.push(...images);
+      if (role === "system" || role === "developer") {
+        if (text.trim()) systemParts.push(text.trim());
+      } else if (role === "assistant") {
+        trailingToolResults.length = 0;
+        trailingUserText = undefined;
+        trailingImages.length = 0;
+        if (text.trim()) transcriptLines.push(`[ASSISTANT]:\n${text}`);
+        items.push({ role: "assistant", text, images, hasTools: false });
+      } else {
+        transcriptLines.push(`[USER]:\n${text || "[empty]"}`);
+        items.push({ role: "user", text, images, hasTools: false });
+        // A user message that follows tool outputs is the same turn's trailing user text
+        // (mirrors the Chat Completions path); without this the new text was silently dropped on resume.
+        if (trailingToolResults.length > 0) {
+          if (text.trim()) trailingUserText = [trailingUserText, text.trim()].filter(Boolean).join("\n");
+          trailingImages.push(...images);
+        } else {
+          trailingUserText = undefined;
+          trailingImages.length = 0;
+        }
+      }
+    }
+  } else {
+    throw new GatewayError("`input` must be a string or array.", 400, "invalid_request_error", "input");
+  }
+
+  const systemJoined = systemParts.join("\n\n");
+  const fullTranscriptText = transcriptLines.join("\n\n");
+  const toolSig = (toolChoice === "none" ? [] : tools).map((t) => t.name).join(",");
+  const prefixHashes = computeDialogPrefixHashes({
+    systemPrompt: systemJoined,
+    toolNamesSignature: toolSig,
+    items
+  });
+  const firstUserItem = items.find((it) => it.role === "user");
+  const conversationKey = deriveConversationAffinityKey({
+    headers,
+    rawBody: body,
+    systemPrompt: systemJoined,
+    firstUserText: firstUserItem?.text
+  });
+  return {
+    requestedModel,
+    rawBody: body,
+    ...(conversationKey ? { conversationKey } : {}),
+    ...(systemJoined ? { systemPrompt: systemJoined } : {}),
+    fullTranscriptText,
+    ...prefixHashes,
+    images: allImages,
+    tools,
+    ...(nativeSdkTools.length > 0 ? { nativeSdkTools } : {}),
+    toolChoice,
+    trailingToolResults,
+    ...(trailingUserText ? { trailingUserText } : {}),
+    ...(trailingImages.length ? { trailingImages } : {}),
+    hasToolResults,
+    stream: body.stream === true,
+    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length),
+    signal
+  };
+}
+
+function formatOpenAiUsageObject(m: TurnTokenMetrics): Record<string, unknown> {
+  const promptTotal = m.inputTokens + m.cacheReadTokens;
+  return {
+    prompt_tokens: promptTotal,
+    completion_tokens: m.outputTokens,
+    total_tokens: promptTotal + m.outputTokens,
+    prompt_tokens_details: { cached_tokens: m.cacheReadTokens },
+    ...(m.reasoningTokens !== undefined
+      ? { completion_tokens_details: { reasoning_tokens: m.reasoningTokens } }
+      : {})
+  };
+}
+
+export function formatOpenAiError(err: GatewayError): Record<string, unknown> {
+  return {
+    error: {
+      message: err.message,
+      type: officialErrorType(err, "openai"),
+      param: err.param ?? null,
+      code: err.code
+    }
+  };
+}
+
+export const openAiChatAdapter: ProtocolAdapter = {
+  errorFormat: "openai",
+  parse: (body, headers, signal) => parseChatCompletionsRequest(body, headers, signal),
+  async collectJson(events, turn) {
+    const id = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+    const created = Math.floor(Date.now() / 1000);
+    const { thinking, text, toolCalls, stopReason, metrics } = await collectTurnEvents(events);
+
+    const message: Record<string, unknown> = {
+      role: "assistant",
+      content: toolCalls.length > 0 && !text ? null : text
+    };
+    if (thinking) message.reasoning_content = thinking;
+    if (toolCalls.length > 0) {
+      message.tool_calls = toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: tc.argumentsJson }
+      }));
+    }
+
+    return {
+      id,
+      object: "chat.completion",
+      created,
+      model: turn.requestedModel,
+      choices: [{ index: 0, message, finish_reason: stopReason }],
+      usage: formatOpenAiUsageObject(metrics)
+    };
+  },
+  async *streamSse(events, turn) {
+    const id = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    const makeChunk = (delta: Record<string, unknown>, finishReason: string | null = null, usageObj?: Record<string, unknown>) => {
+      const payload: Record<string, unknown> = {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: turn.requestedModel,
+        choices: Object.keys(delta).length === 0 && finishReason === null && usageObj
+          ? []
+          : [{ index: 0, delta, finish_reason: finishReason }]
+      };
+      if (usageObj) payload.usage = usageObj;
+      return `data: ${JSON.stringify(payload)}\n\n`;
+    };
+
+    let sentRole = false;
+    let lastMetrics: TurnTokenMetrics | null = null;
+
+    for await (const ev of events) {
+      if (!sentRole && (ev.type === "thinking" || ev.type === "text" || ev.type === "tool_calls")) {
+        sentRole = true;
+        yield makeChunk({ role: "assistant", content: "" });
+      }
+      if (ev.type === "thinking") {
+        yield makeChunk({ reasoning_content: ev.text });
+      } else if (ev.type === "text") {
+        yield makeChunk({ content: ev.text });
+      } else if (ev.type === "tool_calls") {
+        yield makeChunk({
+          tool_calls: ev.calls.map((tc, idx) => ({
+            index: idx,
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.argumentsJson }
+          }))
+        });
+      } else if (ev.type === "usage") {
+        lastMetrics = ev.metrics;
+      } else if (ev.type === "done") {
+        if (!sentRole) {
+          sentRole = true;
+          yield makeChunk({ role: "assistant", content: "" });
+        }
+        yield makeChunk({}, ev.stopReason);
+        if (lastMetrics && turn.includeStreamUsage) yield makeChunk({}, null, formatOpenAiUsageObject(lastMetrics));
+      }
+    }
+    yield "data: [DONE]\n\n";
+  },
+  formatSseErrorFrame: (err) => `data: ${JSON.stringify(formatOpenAiError(err))}\n\ndata: [DONE]\n\n`
+};
+
+export const openAiResponsesAdapter: ProtocolAdapter = {
+  errorFormat: "openai",
+  parse: (body, headers, signal) => parseResponsesRequest(body, headers, signal),
+  async collectJson(events, turn) {
+    const respId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+    const msgId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+    const created = Math.floor(Date.now() / 1000);
+    const { thinking, text, toolCalls, metrics } = await collectTurnEvents(events);
+
+    const output: Array<Record<string, unknown>> = [];
+    if (thinking) {
+      output.push({
+        id: `rs_${crypto.randomUUID().replace(/-/g, "")}`,
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: thinking }]
+      });
+    }
+    if (text || toolCalls.length === 0) {
+      output.push({
+        id: msgId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text, annotations: [] }]
+      });
+    }
+    for (const tc of toolCalls) {
+      output.push({
+        id: `fc_${crypto.randomUUID().replace(/-/g, "")}`,
+        type: "function_call",
+        status: "completed",
+        call_id: tc.id,
+        name: tc.name,
+        arguments: tc.argumentsJson
+      });
+    }
+
+    const totalInput = metrics.inputTokens + metrics.cacheReadTokens;
+    return {
+      id: respId,
+      object: "response",
+      created_at: created,
+      status: "completed",
+      model: turn.requestedModel,
+      output,
+      output_text: text,
+      usage: {
+        input_tokens: totalInput,
+        output_tokens: metrics.outputTokens,
+        total_tokens: totalInput + metrics.outputTokens,
+        input_tokens_details: { cached_tokens: metrics.cacheReadTokens },
+        output_tokens_details: { reasoning_tokens: metrics.reasoningTokens ?? 0 }
+      }
+    };
+  },
+  async *streamSse(events, turn) {
+    const respId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+    const created = Math.floor(Date.now() / 1000);
+    let seq = 0;
+    const sse = (event: string, data: Record<string, unknown>) =>
+      `event: ${event}\ndata: ${JSON.stringify({ type: event, ...data, sequence_number: seq++ })}\n\n`;
+    const newId = (prefix: string) => `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+    const baseResponse = (status: string, output: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}) => ({
+      id: respId,
+      object: "response",
+      created_at: created,
+      status,
+      model: turn.requestedModel,
+      output,
+      ...extra
+    });
+
+    // Pull the first upstream event BEFORE yielding `response.created` so pre-stream
+    // 401/403/429/502 errors surface as real HTTP statuses instead of HTTP 200 SSE.
+    const iter = events[Symbol.asyncIterator]();
+    let step = await iter.next();
+
+    yield sse("response.created", { response: baseResponse("in_progress", []) });
+    yield sse("response.in_progress", { response: baseResponse("in_progress", []) });
+
+    // Items are opened lazily and closed on every kind transition (reasoning <-> message <-> tool calls),
+    // so a model that interleaves them still yields a spec-shaped stream.
+    const output: Array<Record<string, unknown>> = [];
+    let open: { kind: "reasoning" | "message"; id: string; index: number; text: string } | null = null;
+    let fullText = "";
+    let sawMessage = false;
+    let sawToolCalls = false;
+    let metrics: TurnTokenMetrics = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+    const closeOpen = function* (): Generator<string> {
+      if (!open) return;
+      const cur = open;
+      open = null;
+      if (cur.kind === "reasoning") {
+        const part = { type: "summary_text", text: cur.text };
+        yield sse("response.reasoning_summary_text.done", { item_id: cur.id, output_index: cur.index, summary_index: 0, text: cur.text });
+        yield sse("response.reasoning_summary_part.done", { item_id: cur.id, output_index: cur.index, summary_index: 0, part });
+        const item = { id: cur.id, type: "reasoning", summary: [part] };
+        output[cur.index] = item;
+        yield sse("response.output_item.done", { output_index: cur.index, item });
+      } else {
+        const part = { type: "output_text", text: cur.text, annotations: [] };
+        yield sse("response.output_text.done", { item_id: cur.id, output_index: cur.index, content_index: 0, text: cur.text });
+        yield sse("response.content_part.done", { item_id: cur.id, output_index: cur.index, content_index: 0, part });
+        const item = { id: cur.id, type: "message", status: "completed", role: "assistant", content: [part] };
+        output[cur.index] = item;
+        yield sse("response.output_item.done", { output_index: cur.index, item });
+      }
+    };
+
+    const openItem = function* (kind: "reasoning" | "message"): Generator<string> {
+      if (open && open.kind === kind) return;
+      yield* closeOpen();
+      const index = output.length;
+      const id = newId(kind === "reasoning" ? "rs" : "msg");
+      output.push({});
+      open = { kind, id, index, text: "" };
+      if (kind === "reasoning") {
+        yield sse("response.output_item.added", { output_index: index, item: { id, type: "reasoning", summary: [] } });
+        yield sse("response.reasoning_summary_part.added", {
+          item_id: id, output_index: index, summary_index: 0, part: { type: "summary_text", text: "" }
+        });
+      } else {
+        sawMessage = true;
+        yield sse("response.output_item.added", {
+          output_index: index,
+          item: { id, type: "message", status: "in_progress", role: "assistant", content: [] }
+        });
+        yield sse("response.content_part.added", {
+          item_id: id, output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] }
+        });
+      }
+    };
+
+    try {
+      while (!step.done) {
+        const ev = step.value;
+        if (ev.type === "thinking") {
+          if (ev.text) {
+            yield* openItem("reasoning");
+            open!.text += ev.text;
+            yield sse("response.reasoning_summary_text.delta", {
+              item_id: open!.id, output_index: open!.index, summary_index: 0, delta: ev.text
+            });
+          }
+        } else if (ev.type === "text") {
+          if (ev.text) {
+            yield* openItem("message");
+            open!.text += ev.text;
+            fullText += ev.text;
+            yield sse("response.output_text.delta", {
+              item_id: open!.id, output_index: open!.index, content_index: 0, delta: ev.text
+            });
+          }
+        } else if (ev.type === "tool_calls") {
+          yield* closeOpen();
+          sawToolCalls = true;
+          for (const tc of ev.calls) {
+            const index = output.length;
+            const id = newId("fc");
+            const base = { id, type: "function_call", call_id: tc.id, name: tc.name };
+            output.push({});
+            yield sse("response.output_item.added", { output_index: index, item: { ...base, status: "in_progress", arguments: "" } });
+            yield sse("response.function_call_arguments.delta", { item_id: id, output_index: index, delta: tc.argumentsJson });
+            yield sse("response.function_call_arguments.done", { item_id: id, output_index: index, name: tc.name, arguments: tc.argumentsJson });
+            const item = { ...base, status: "completed", arguments: tc.argumentsJson };
+            output[index] = item;
+            yield sse("response.output_item.done", { output_index: index, item });
+          }
+        } else if (ev.type === "usage") {
+          metrics = ev.metrics;
+        }
+        step = await iter.next();
+      }
+    } finally {
+      await iter.return?.().catch(() => undefined);
+    }
+    yield* closeOpen();
+
+    // A reply with no text and no tool call still carries one (empty) assistant message, as the official API does.
+    if (!sawMessage && !sawToolCalls) {
+      yield* openItem("message");
+      yield* closeOpen();
+    }
+
+    const totalInput = metrics.inputTokens + metrics.cacheReadTokens;
+    yield sse("response.completed", {
+      response: baseResponse("completed", output, {
+        output_text: fullText,
+        usage: {
+          input_tokens: totalInput,
+          output_tokens: metrics.outputTokens,
+          total_tokens: totalInput + metrics.outputTokens,
+          input_tokens_details: { cached_tokens: metrics.cacheReadTokens },
+          output_tokens_details: { reasoning_tokens: metrics.reasoningTokens ?? 0 }
+        }
+      })
+    });
+  },
+  formatSseErrorFrame: (err) =>
+    `event: error\ndata: ${JSON.stringify({
+      type: "error",
+      code: err.code,
+      message: err.message,
+      param: err.param ?? null
+    })}\n\n`
+};

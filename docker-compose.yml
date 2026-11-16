@@ -1,0 +1,16 @@
+services:
+  cursor-proxy-api:
+    build: .
+    container_name: cursor-proxy-api
+    restart: unless-stopped
+    ports:
+      # Bind strictly to localhost when fronting with Caddy/Nginx on the same host,
+      # or change to "6718:6718" if exposing directly within a private LAN.
+      - "127.0.0.1:6718:6718"
+    volumes:
+      # Persist .env and gateway-keys.json inside ./data
+      - ./data:/app/data
+    environment:
+      - HOST=0.0.0.0
+      - PORT=6718
+      - ENV_FILE_PATH=/app/data/.env

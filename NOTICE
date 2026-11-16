@@ -1,0 +1,15 @@
+CursorProxyAPI
+Copyright (c) 2026 CursorProxyAPI Contributors
+
+This project is an independent, unofficial gateway and is NOT affiliated with,
+endorsed by, or sponsored by Anysphere, Inc. ("Cursor").
+
+Acknowledgments:
+- Inspired by cursor2response (https://github.com/iFwu/cursor2response, MIT License).
+
+Third-party proprietary dependency notice:
+- `@cursor/sdk` is NOT redistributed in this repository. Installing `@cursor/sdk`
+  via npm or building a container image locally fetches Anysphere, Inc.'s package
+  under its own license (`© Anysphere Inc. All rights reserved. Use is subject to
+  Cursor's Terms of Service.`). Do NOT publish pre-built Docker images or archives
+  containing `node_modules/@cursor/sdk`.

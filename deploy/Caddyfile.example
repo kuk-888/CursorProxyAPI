@@ -1,0 +1,32 @@
+# Option A: Dedicated Subdomain (e.g. https://cursor-api.example.com)
+cursor-api.example.com {
+	request_body {
+		max_size 16MB
+	}
+	handle_errors {
+		@too_large expression `{err.status_code} == 413`
+		handle @too_large {
+			header Content-Type application/json
+			respond `{"error":{"message":"Request body exceeds limit of 16777216 bytes.","type":"invalid_request_error","code":"request_too_large"}}` 413
+		}
+		respond `{err.status_code}` {err.status_code}
+	}
+	reverse_proxy 127.0.0.1:6718 {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# Option B: Subpath Mount on an Existing Domain (e.g. https://api.example.com/cursor/*)
+# api.example.com {
+# 	request_body {
+# 		max_size 16MB
+# 	}
+# 	handle /cursor/* {
+# 		uri strip_prefix /cursor
+# 		reverse_proxy 127.0.0.1:6718 {
+# 			flush_interval -1
+# 			header_up X-Real-IP {remote_host}
+# 		}
+# 	}
+# }
