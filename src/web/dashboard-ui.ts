@@ -195,7 +195,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     #appShell {
       display: none;
       min-height: 100vh;
-      grid-template-columns: 220px 1fr;
+      min-width: 0;
+      max-width: 100%;
+      grid-template-columns: 220px minmax(0, 1fr);
     }
     @media (max-width: 860px) {
       #appShell { grid-template-columns: 1fr; }
@@ -258,9 +260,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .tb-icon-btn svg { width: 15px; height: 15px; stroke-width: 1.8; flex-shrink: 0; }
     .tb-lbl { font-size: 10.5px; line-height: 1.1; white-space: nowrap; }
 
-    .workspace { padding: 24px; max-width: 1360px; width: 100%; }
-    .view-pane { display: none; }
-    .view-pane.active { display: block; }
+    .workspace { padding: 24px; max-width: 1360px; width: 100%; min-width: 0; overflow-x: clip; }
+    .view-pane { display: none; min-width: 0; }
+    .view-pane.active { display: block; min-width: 0; max-width: 100%; }
 
     #noticeBar {
       display: none; padding: 9px 14px; border: 1px solid var(--border);
@@ -360,6 +362,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       overflow: hidden;
       margin-bottom: 18px;
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+      min-width: 0;
+      max-width: 100%;
     }
     .panel-hdr {
       padding: 12px 16px;
@@ -376,18 +380,48 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
     }
 
-    .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .table-wrap {
+      overflow-x: auto;
+      overflow-y: hidden;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      overscroll-behavior-x: contain;
+      isolation: isolate;
+    }
+    table {
+      width: max-content;
+      min-width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 12.5px;
+    }
     th {
       text-align: left; padding: 9px 11px; font-size: 11px; font-weight: 500;
       color: var(--fg-muted); background: var(--subtle); border-bottom: 1px solid var(--border);
       white-space: nowrap;
     }
-    td { padding: 10px 11px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    td {
+      padding: 10px 11px; border-bottom: 1px solid var(--border); vertical-align: middle;
+      white-space: nowrap; background: var(--panel);
+    }
     tr:last-child td { border-bottom: none; }
-    tr.row-disabled td { opacity: 0.52; }
+    tr.row-disabled td:not(.ops-cell) { opacity: 0.52; }
     tr.clickable-row { cursor: pointer; transition: background-color 0.1s; }
-    tr.clickable-row:hover td { background: var(--panel-hover); }
+    tr.clickable-row:hover td, tr:hover td { background: var(--panel-hover); }
+    th.ops-cell, td.ops-cell {
+      position: sticky;
+      right: 0;
+      z-index: 3;
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      box-shadow: -8px 0 12px -8px rgba(0, 0, 0, 0.18);
+    }
+    th.ops-cell { z-index: 4; background: var(--subtle); }
+    tr:hover td.ops-cell, tr.clickable-row:hover td.ops-cell { background: var(--panel-hover); }
+    .ops-stack { display: flex; flex-wrap: nowrap; gap: 4px; width: max-content; }
+    .bill-cell, .run-cell { white-space: normal; max-width: 220px; }
+    .bill-cell > div, .run-cell > div { white-space: normal; }
 
     .status-line { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
     .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
@@ -406,10 +440,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .tag-ok { color: var(--ok); border-color: rgba(16,185,129,0.35); }
     .tag-warn { color: var(--warn); border-color: rgba(245,158,11,0.35); }
 
-    .qbar-cell { min-width: 118px; }
-    .qbar-top { display: flex; justify-content: space-between; font-size: 11.5px; margin-bottom: 4px; }
+    .qbar-cell { width: 128px; min-width: 128px; max-width: 128px; }
+    .qbar-top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11.5px; margin-bottom: 4px; min-width: 0; }
+    .qbar-rem { color: var(--fg-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
     .qbar-track { height: 5px; background: var(--track); border-radius: 2px; overflow: hidden; }
     .qbar-fill { height: 100%; border-radius: 2px; transition: width 0.25s ease; }
+    .bot-stack { width: 128px; max-width: 128px; white-space: normal; }
 
     .setting-row {
       display: flex; align-items: center; justify-content: space-between; gap: 20px;
@@ -688,8 +724,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                     <th>状态</th>
                     <th>账号标识 / 邮箱</th>
                     <th>套餐</th>
-                    <th>Auto / Grok 剩余额度</th>
-                    <th>高级 API 剩余额度</th>
+                    <th>Auto / Grok 已用额度</th>
+                    <th>高级 API 已用额度</th>
                     <th>Bot 额度</th>
                     <th>总额度池 / 按需支出</th>
                     <th>粘性会话 / 调度</th>
@@ -795,12 +831,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                     <th>启用</th>
                     <th>备注 / 掩码凭证</th>
                     <th>绑定账号与周期</th>
-                    <th>Auto 池余量</th>
-                    <th>API 池余量</th>
+                    <th>Auto 池已用</th>
+                    <th>API 池已用</th>
                     <th>Bot 额度</th>
                     <th>账单详情</th>
                     <th>运行状态与统计</th>
-                    <th>操作</th>
+                    <th class="ops-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody id="credTableBody"></tbody>
@@ -829,7 +865,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                     <th>可访问模型范围</th>
                     <th>次数限制 / 有效期</th>
                     <th>累计 Token / 最近调用</th>
-                    <th>操作</th>
+                    <th class="ops-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody id="clientKeysBody"></tbody>
@@ -1234,8 +1270,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "状态": "Status",
       "账号标识 / 邮箱": "Account / Email",
       "套餐": "Plan",
-      "Auto / Grok 剩余额度": "Auto / Grok Remaining",
-      "高级 API 剩余额度": "Premium API Remaining",
+      "Auto / Grok 已用额度": "Auto / Grok Used",
+      "高级 API 已用额度": "Premium API Used",
       "Bot 额度": "Bot Quota",
       "总额度池 / 按需支出": "Included / On-Demand",
       "粘性会话 / 调度": "Sticky / Dispatched",
@@ -1274,8 +1310,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "启用": "Enabled",
       "备注 / 掩码凭证": "Label / Masked Key",
       "绑定账号与周期": "Account & Billing Cycle",
-      "Auto 池余量": "Auto Pool",
-      "API 池余量": "API Pool",
+      "Auto 池已用": "Auto Pool Used",
+      "API 池已用": "API Pool Used",
       "账单详情": "Billing",
       "运行状态与统计": "Runtime Status & Stats",
       "操作": "Actions",
@@ -1582,10 +1618,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       return '<span title="' + esc(fmt(n)) + '"' + (extraStyle ? ' style="' + extraStyle + '"' : '') + '>' + fmtTok(n) + '</span>';
     }
 
-    function barColor(pct) {
-      if (pct == null) return "var(--fg-faint)";
-      if (pct <= 10) return "var(--err)";
-      if (pct <= 30) return "var(--warn)";
+    function barColor(used) {
+      if (used == null) return "var(--fg-faint)";
+      if (used >= 90) return "var(--err)";
+      if (used >= 70) return "var(--warn)";
       return "var(--ok)";
     }
 
@@ -1674,9 +1710,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     function renderQuotaCell(poolObj) {
       const rem = poolObj && poolObj.remainingPercent != null ? poolObj.remainingPercent : null;
       if (rem === null) return '<span style="color:var(--fg-faint);" title="' + esc(tr("点击同步最新额度获取", "Click Sync Quotas to fetch")) + '">—</span>';
-      return '<div class="qbar-cell">' +
-        '<div class="qbar-top"><span class="mono">' + rem.toFixed(1) + '%</span><span style="color:var(--fg-muted);font-size:11px;">' + esc(tr("已用 ", "Used ")) + (100 - rem).toFixed(1) + '%</span></div>' +
-        '<div class="qbar-track"><div class="qbar-fill" style="width:' + rem + '%;background:' + barColor(rem) + ';"></div></div>' +
+      const used = Math.max(0, Math.min(100, 100 - rem));
+      return '<div class="qbar-cell" title="' + esc(tr("已用 ", "Used ") + used.toFixed(1) + tr("% · 剩余 ", "% · left ") + rem.toFixed(1) + '%') + '">' +
+        '<div class="qbar-top"><span class="mono">' + used.toFixed(1) + '%</span><span class="qbar-rem">' + esc(tr("剩余 ", "Left ")) + rem.toFixed(1) + '%</span></div>' +
+        '<div class="qbar-track"><div class="qbar-fill" style="width:' + used + '%;background:' + barColor(used) + ';"></div></div>' +
       '</div>';
     }
 
@@ -1684,7 +1721,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       if (!bot) return '<span style="color:var(--fg-faint);">—</span>';
       if (!bot.hasLimit) return '<span style="color:var(--fg-muted);">' + esc(tr("无 Bot 额度", "No Bot Quota")) + '</span>';
       const rem = bot.remainingPercent;
-      return renderQuotaCell({ remainingPercent: rem }) + (bot.resetAt ? '<div style="font-size:11px;color:var(--fg-muted);">' + esc(tr("重置 ", "Resets ")) + esc(new Date(bot.resetAt).toLocaleDateString()) + '</div>' : '');
+      return '<div class="bot-stack">' + renderQuotaCell({ remainingPercent: rem }) + (bot.resetAt ? '<div style="font-size:11px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("重置 ", "Resets ")) + esc(new Date(bot.resetAt).toLocaleDateString()) + '</div>' : '') + '</div>';
     }
 
     function renderStatusDot(slot) {
@@ -2044,18 +2081,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<td>' + renderQuotaCell(q.cursorModelsAutoPool) + '</td>' +
           '<td>' + renderQuotaCell(q.premiumApiPool) + '</td>' +
           '<td>' + renderBotCell(s.bot) + '</td>' +
-          '<td style="font-size:11.5px;white-space:nowrap;">' +
+          '<td class="bill-cell" style="font-size:11.5px;">' +
             '<div>' + esc(tr('套餐池: ', 'Plan: ')) + (bd ? ('$' + bd.includedUsd + tr(' + 赠 $', ' + bonus $') + bd.bonusUsd) : '—') + '</div>' +
             '<div style="color:' + (od && od.enabled ? 'var(--warn)' : 'var(--fg-muted)') + ';">On-Demand: ' + (od && od.enabled ? (tr('开启 (已用 $', 'ON (used $') + od.usedUsd.toFixed(2) + ')') : tr('已关闭', 'OFF')) + '</div>' +
           '</td>' +
-          '<td style="font-size:11.5px;min-width:170px;">' +
+          '<td class="run-cell" style="font-size:11.5px;">' +
             '<div>' + renderStatusDot(s) + '</div>' +
             (s.autoDisabledReason ? '<div style="color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:2px;">' + esc(s.autoDisabledReason) + '</div>' : '') +
             (s.autoDisabledKind === 'quota' ? '<div style="color:var(--fg-muted);margin-top:2px;">' + esc(tr('Key 本身有效，仅网关暂停调度；', 'Key valid, scheduling paused; ')) + (s.autoRecoverAt ? (tr('预计 ', 'est. ') + esc(new Date(s.autoRecoverAt).toLocaleString()) + tr(' 自动恢复，', ' auto-reset, ')) : '') + esc(tr('充值或开超额后，点“同步官方额度”即可恢复', 'click Sync Quotas after top-up')) + '</div>' : '') +
             (s.autoDisabledKind === 'auth' ? '<div style="color:var(--fg-muted);margin-top:2px;">' + esc(tr('上游拒绝了该 Key（可能已被吊销或失效），不会自动恢复；确认 Key 有效后请点“重新检测”', 'Rejected by upstream (revoked/invalid); click Recheck once valid')) + '</div>' : '') +
-            '<div style="color:var(--fg-muted);margin-top:2px;white-space:nowrap;">' + esc(tr('调度 ', 'Dispatched ')) + fmt(s.totalSelected) + esc(tr(' · 亲和 ', ' · Affinity ')) + fmt(s.affinityHits) + esc(tr(' · 429限流 ', ' · 429s ')) + fmt(s.rateLimitHits) + '</div>' +
+            '<div style="color:var(--fg-muted);margin-top:2px;">' + esc(tr('调度 ', 'Dispatched ')) + fmt(s.totalSelected) + esc(tr(' · 亲和 ', ' · Affinity ')) + fmt(s.affinityHits) + esc(tr(' · 429限流 ', ' · 429s ')) + fmt(s.rateLimitHits) + '</div>' +
           '</td>' +
-          '<td><div style="display:flex;gap:4px;">' +
+          '<td class="ops-cell"><div class="ops-stack">' +
             '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '">' + esc(tr('日志', 'Logs')) + '</button>' +
             (od ? '<button class="btn-xs" data-click="toggleOnDemand" data-arg="' + esc(s.slotId) + '" data-arg2="' + (od.enabled ? 'off' : 'on') + '">' + esc(od.enabled ? tr('关超额', 'Disable OD') : tr('开超额', 'Enable OD')) + '</button>' : '') +
             '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '">' + esc(tr('备注', 'Label')) + '</button>' +
@@ -2438,7 +2475,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<td>' + scopeHtml + '</td>' +
           '<td>' + limitHtml + '</td>' +
           '<td class="mono" style="font-size:11.5px;"><div>' + esc(tr('入 ', 'In ')) + fmtTok(st.inputTokens) + esc(tr(' / 出 ', ' / Out ')) + fmtTok(st.outputTokens) + '</div><div style="color:var(--fg-muted);">' + esc(lastTime) + '</div></td>' +
-          '<td><div style="display:flex;gap:5px;">' +
+          '<td class="ops-cell"><div class="ops-stack">' +
             '<button class="btn-xs" data-click="openEditCkModal" data-arg="' + esc(k.id) + '">' + esc(tr('编辑配置', 'Edit')) + '</button>' +
             (k.maxRequests != null && st.requests > 0 ? '<button class="btn-xs" data-click="resetCkUsedCount" data-arg="' + esc(k.id) + '">' + esc(tr('重置次数', 'Reset')) + '</button>' : '') +
             '<button class="btn-xs btn-danger" data-click="deleteCk" data-arg="' + esc(k.id) + '">' + esc(tr('删除', 'Delete')) + '</button>' +
