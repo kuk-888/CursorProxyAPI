@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+gateway-keys.json
+gateway-keys.json.*
+admin-session.key
+usage-ledger.json
+usage-ledger.json.*
+gw-qa/
+*-star
+*.log
+*.tgz
+.DS_Store
